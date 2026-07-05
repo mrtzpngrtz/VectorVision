@@ -4,7 +4,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 // the ipcRenderer without exposing the entire object
 contextBridge.exposeInMainWorld('electronAPI', {
     // Scan folder for images
-    scanFolder: (folderPath) => ipcRenderer.invoke('scan-folder', folderPath),
+    scanFolder: (folderPath, recursive) => ipcRenderer.invoke('scan-folder', folderPath, recursive),
     
     // Load database (with optional libraryId)
     loadDatabase: (libraryId) => ipcRenderer.invoke('load-database', libraryId),
@@ -17,8 +17,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     saveLibraries: (libraries) => ipcRenderer.invoke('save-libraries', libraries),
     deleteLibraryDb: (libraryId) => ipcRenderer.invoke('delete-library-db', libraryId),
     
-    // Analyze images (returns promise)
-    analyzeImages: (imagePaths) => ipcRenderer.invoke('analyze-images', imagePaths),
+    // Analyze images (returns promise). Forward forceReloadLabels so Force Rescan
+    // actually reloads labels.js (the main handler honors the 2nd arg).
+    analyzeImages: (imagePaths, forceReloadLabels = false) => ipcRenderer.invoke('analyze-images', imagePaths, forceReloadLabels),
     
     // Get image data as base64
     getImageData: (imagePath) => ipcRenderer.invoke('get-image-data', imagePath),

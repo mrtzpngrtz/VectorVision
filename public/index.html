@@ -111,8 +111,11 @@
 
         <!-- MAIN VIEW -->
         <div id="main">
+            <!-- Canvas must be separate from map-container to avoid transform issues -->
+            <canvas id="render-canvas" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 10;"></canvas>
             
-            <div id="map-container"></div>
+            <div id="map-container">
+            </div>
             
             <div id="active-tag-display">
                 <span id="active-tag-text"></span>
@@ -197,6 +200,10 @@
         <div class="modal-content">
             <h3>Library Name</h3>
             <input type="text" id="library-name-input" placeholder="Enter library name...">
+            <label class="checkbox-container" style="margin-top: 10px;">
+                <input type="checkbox" id="library-recursive-checkbox">
+                <span>Include subfolders</span>
+            </label>
             <div class="modal-buttons">
                 <button onclick="confirmLibraryName()" class="primary-btn">Save</button>
                 <button onclick="cancelLibraryName()" class="secondary-btn">Cancel</button>
@@ -364,6 +371,7 @@
         </div>
     </div>
 
+    <script src="js/canvas-renderer.js"></script>
     <script src="js/app.js"></script>
 </body>
 </html>

@@ -21,10 +21,15 @@ function createWindow() {
 
     mainWindow.loadFile(path.join(__dirname, 'public', 'index.html'));
 
-    // Open DevTools in development mode
-    if (process.argv.includes('--dev')) {
-        mainWindow.webContents.openDevTools();
-    }
+    // Open DevTools by default for debugging
+    mainWindow.webContents.openDevTools();
+    
+    // Add keyboard shortcut to toggle DevTools (F12)
+    mainWindow.webContents.on('before-input-event', (event, input) => {
+        if (input.key === 'F12') {
+            mainWindow.webContents.toggleDevTools();
+        }
+    });
 
     mainWindow.on('closed', () => {
         mainWindow = null;
@@ -52,37 +57,58 @@ app.on('window-all-closed', () => {
 
 // IPC Handlers
 
+// Helper function to recursively scan directories
+function scanDirectory(dirPath, recursive = false) {
+    const images = [];
+    const supportedExts = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.mp4', '.webm'];
+    
+    function scan(currentPath) {
+        try {
+            const items = fs.readdirSync(currentPath);
+            
+            for (const item of items) {
+                const itemPath = path.join(currentPath, item);
+                
+                try {
+                    const stats = fs.statSync(itemPath);
+                    
+                    if (stats.isDirectory() && recursive) {
+                        // Recursively scan subdirectory
+                        scan(itemPath);
+                    } else if (stats.isFile()) {
+                        const ext = path.extname(item).toLowerCase();
+                        if (supportedExts.includes(ext)) {
+                            const mediaType = ['.mp4', '.webm', '.gif'].includes(ext) ? 'video' : 'static';
+                            
+                            images.push({
+                                name: item,
+                                path: itemPath,
+                                created: stats.birthtimeMs || stats.mtimeMs,
+                                mediaType: mediaType
+                            });
+                        }
+                    }
+                } catch (statErr) {
+                    console.warn(`Could not stat ${itemPath}:`, statErr.message);
+                }
+            }
+        } catch (readErr) {
+            console.warn(`Could not read directory ${currentPath}:`, readErr.message);
+        }
+    }
+    
+    scan(dirPath);
+    return images;
+}
+
 // Scan folder for images
-ipcMain.handle('scan-folder', async (event, folderPath) => {
+ipcMain.handle('scan-folder', async (event, folderPath, recursive = false) => {
     if (!folderPath || !fs.existsSync(folderPath)) {
         throw new Error('Invalid folder path');
     }
 
     try {
-        const files = fs.readdirSync(folderPath);
-        const images = files.filter(file => {
-            const ext = path.extname(file).toLowerCase();
-            return ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.mp4', '.webm'].includes(ext);
-        }).map(file => {
-            const filePath = path.join(folderPath, file);
-            const ext = path.extname(file).toLowerCase();
-            // gif, mp4, webm are animated/video content
-            const mediaType = ['.mp4', '.webm', '.gif'].includes(ext) ? 'video' : 'static';
-            
-            let created = 0;
-            try {
-                const stats = fs.statSync(filePath);
-                created = stats.birthtimeMs || stats.mtimeMs;
-            } catch(e) {}
-            
-            return {
-                name: file,
-                path: filePath,
-                created: created,
-                mediaType: mediaType
-            };
-        });
-
+        const images = scanDirectory(folderPath, recursive);
         return { images };
     } catch (error) {
         throw new Error(error.message);

@@ -2,9 +2,6 @@ let images = [];
 let currentVisibleImages = [];
 let hoveredIndex = -1;
 let hardwareAccel = 'NATIVE_ONNX';
-let currentWorldWidth = 4000;
-let currentWorldHeight = 4000;
-let currentWorldDepth = 4000;
 const mapContainer = document.getElementById('map-container');
 const statusDiv = document.getElementById('status');
 const statusDescDiv = document.getElementById('status-description');
@@ -1035,28 +1032,19 @@ async function trainColor(is3DMode) {
     if (vectors.length === 0) return;
     statusDiv.textContent = 'MAPPING_COLOR_SPACE';
     setLoading(true);
-
-    // Train on the Web Worker (SimpleSOM lives in som-worker.js, not the main
-    // thread). trainSOMAsync returns one BMU position per input vector, in the
-    // same order as `vectors` — i.e. aligned to `valid`.
-    let positions;
-    try {
-        if (is3DMode) {
-            const gridSize = Math.ceil(Math.cbrt(vectors.length) * 2);
-            positions = await trainSOMAsync(vectors, gridSize, gridSize, gridSize, Math.max(1000, vectors.length * 2));
-        } else {
-            const gridSize = Math.ceil(Math.sqrt(vectors.length) * 1.5);
-            positions = await trainSOMAsync(vectors, gridSize, gridSize, 1, Math.max(1000, vectors.length * 2));
-        }
-    } catch (err) {
-        console.error('Color mapping failed:', err);
-        statusDiv.textContent = 'ERR: COLOR_MAPPING_FAILED';
-        setLoading(false);
-        return;
+    let som;
+    if (is3DMode) {
+        const gridSize = Math.ceil(Math.cbrt(vectors.length) * 2);
+        som = new SimpleSOM(gridSize, gridSize, gridSize, 3, Math.max(1000, vectors.length * 2));
+    } else {
+        const gridSize = Math.ceil(Math.sqrt(vectors.length) * 1.5);
+        som = new SimpleSOM(gridSize, gridSize, 1, 3, Math.max(1000, vectors.length * 2));
     }
-
+    await som.trainAsync(vectors, (c, t) => {
+        statusDiv.textContent = `TRAINING: ${Math.round(c/t*100)}%`;
+    });
     valid.forEach((img, i) => {
-        const pos = positions[i];
+        const pos = som.getBMU(img.colorVector);
         if (is3DMode) { img.xC3 = pos.x; img.yC3 = pos.y; img.zC3 = pos.z; }
         else { img.xC = pos.x; img.yC = pos.y; }
     });
@@ -1302,15 +1290,10 @@ function displayImages(imageList) {
     // Store for lightbox navigation
     currentVisibleImages = imageList;
     
-    // Calculate coordinates for each image based on current sort mode.
-    // Each sort routine writes its own side-fields (color->xC/xC3, lightness->
-    // xLight, similarity->xSim, vibe->xVibe); the CanvasRenderer only ever reads
-    // item.x/item.y (2D) or item.x3/y3/z3 (3D). So we MUST copy the active sort's
-    // coordinates into those canonical fields here — otherwise the renderer draws
-    // the stale semantic layout, or culls everything when the fields are undefined.
+    // Calculate coordinates for each image based on current sort mode
     const itemsWithCoords = imageList.map((img, i) => {
         const item = { ...img };
-
+        
         if (currentSort === 'grid') {
             if (is3D) {
                 const side = Math.ceil(Math.cbrt(imageList.length));
@@ -1323,18 +1306,12 @@ function displayImages(imageList) {
                 item.y = Math.floor(i / cols);
             }
         } else if (currentSort === 'color') {
-            if (is3D) { item.x3 = img.xC3; item.y3 = img.yC3; item.z3 = img.zC3; }
-            else { item.x = img.xC; item.y = img.yC; }
+            // Coordinates already set in trainColor
         } else if (currentSort === 'lightness') {
-            if (is3D) { item.x3 = img.xLight; item.y3 = img.yLight; item.z3 = img.zLight; }
-            else { item.x = img.xLight; item.y = img.yLight; }
-        } else if (currentSort === 'similarity') {
-            item.x = img.xSim; item.y = img.ySim;
-        } else if (currentSort === 'vibe') {
-            item.x = img.xVibe; item.y = img.yVibe;
+            // Coordinates already set in calculateLightness
         }
-        // else: semantic — x/y (2D) or x3/y3/z3 (3D) already present from train2D/train3D
-
+        // For semantic/similarity/vibe, coordinates are already in the data
+        
         return item;
     });
     
@@ -1352,63 +1329,38 @@ function displayImages(imageList) {
         return;
     }
     
-    // Calculate scaling - find max coordinates
-    // We want to fit in 4000x4000, BUT we must respect minimum spacing to avoid overlap
-    // The image size is 80, so we need at least 100-120 units of space per item
-    const MIN_SPACING = 120;
-    
+    // Calculate scaling - find max coordinates to scale to 4000x4000 space
     const coords = validItems.map(item => ({
         x: is3D ? (item.x3 || 0) : (item.x || 0),
         y: is3D ? (item.y3 || 0) : (item.y || 0),
         z: is3D ? (item.z3 || 0) : 0
     }));
-
-    // Find coordinate extents. Layouts differ: grid/semantic/color use
-    // non-negative indices, but the similarity "solar system" is CENTERED, so its
-    // coordinates go negative. Scaling from min..max (not 0..max) and offsetting by
-    // min keeps every layout fully on-screen regardless of its origin — otherwise
-    // the negative half falls off the left/top and the view looks jumped.
-    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, minZ = Infinity, maxZ = -Infinity;
-    for (const c of coords) {
-        if (c.x < minX) minX = c.x; if (c.x > maxX) maxX = c.x;
-        if (c.y < minY) minY = c.y; if (c.y > maxY) maxY = c.y;
-        if (c.z < minZ) minZ = c.z; if (c.z > maxZ) maxZ = c.z;
-    }
-    const rangeX = Math.max(maxX - minX, 1);
-    const rangeY = Math.max(maxY - minY, 1);
-    const rangeZ = Math.max(maxZ - minZ, 1);
-
-    // Scale required to fit in 4000, but respect minimum spacing to avoid overlap.
-    const scaleX = Math.max(4000 / (rangeX + 2), MIN_SPACING);
-    const scaleY = Math.max(4000 / (rangeY + 2), MIN_SPACING);
-    const scaleZ = Math.max(4000 / (rangeZ + 2), MIN_SPACING);
-
-    // Update global world dimensions for centering
-    currentWorldWidth = scaleX * (rangeX + 2);
-    currentWorldHeight = scaleY * (rangeY + 2);
-    currentWorldDepth = scaleZ * (rangeZ + 2);
-
-    // Scale coordinates, offsetting by min so the layout starts near 0 in world space.
+    
+    const maxX = Math.max(...coords.map(c => c.x), 1);
+    const maxY = Math.max(...coords.map(c => c.y), 1);
+    const maxZ = Math.max(...coords.map(c => c.z), 1);
+    
+    const scaleX = 4000 / (maxX + 2);
+    const scaleY = 4000 / (maxY + 2);
+    const scaleZ = 4000 / (maxZ + 2);
+    
+    // Scale coordinates to fit in 4000x4000 space
     const scaledItems = validItems.map(item => {
         const scaled = { ...item };
         if (is3D) {
-            scaled.x3 = ((item.x3 || 0) - minX) * scaleX;
-            scaled.y3 = ((item.y3 || 0) - minY) * scaleY;
-            scaled.z3 = ((item.z3 || 0) - minZ) * scaleZ;
+            scaled.x3 = (item.x3 || 0) * scaleX;
+            scaled. y3 = (item.y3 || 0) * scaleY;
+            scaled.z3 = (item.z3 || 0) * scaleZ;
         } else {
-            scaled.x = ((item.x || 0) - minX) * scaleX;
-            scaled.y = ((item.y || 0) - minY) * scaleY;
+            scaled.x = (item.x || 0) * scaleX;
+            scaled.y = (item.y || 0) * scaleY;
         }
         return scaled;
     });
     
-    // Make sure the canvas matches its real on-screen size before we render,
-    // otherwise items below a stale (too-small) displayHeight get culled.
-    renderer.handleResize();
-
     // Set 3D mode on renderer
     renderer.set3DMode(is3D);
-
+    
     // Update camera to match current view state
     renderer.setCamera({
         x: is3D ? transX : pointX,
@@ -1419,9 +1371,17 @@ function displayImages(imageList) {
         rotY: is3D ? rotY : 0
     });
     
-    // Pass items to renderer (setItems schedules a batched render via rAF)
+    // Pass items to renderer
+    console.log('Passing items to renderer:', scaledItems.length, 'items');
+    console.log('Sample item:', scaledItems[0]);
+    console.log('Renderer is3D:', is3D);
+    console.log('Camera state:', renderer.camera);
+    
     renderer.setItems(scaledItems);
-
+    
+    // Force an immediate render
+    renderer.render();
+    
     // Update word cloud after displaying images
     updateWordCloud();
     updateColorFilter();
@@ -1435,35 +1395,30 @@ function highlightNeighbors(targetIndex) {
         clearHighlight();
         return;
     }
-
-    if (!renderer) return;
-    const items = renderer.items;
-    const target = items[targetIndex];
-    if (!target || !target.features) return;
-
+    
+    const target = images[targetIndex]; 
+    if (!target.features) return;
+    
     isHighlighting = true;
-
-    // Dim everything on the canvas, then restore the nearest neighbours.
-    for (const item of items) item._renderOpacity = 0.1;
-
-    const dists = items.map((img, i) => {
+    imageNodeElements.forEach(n => { n.style.opacity = '0.1'; });
+    const dists = images.map((img, i) => {
         if (!img.features) return { idx: i, d: Infinity };
-        let d = 0; for (let k = 0; k < img.features.length; k++) d += (img.features[k] - target.features[k]) ** 2;
+        let d = 0; for(let k=0; k<img.features.length; k++) d += (img.features[k] - target.features[k])**2;
         return { idx: i, d: d };
     });
-    dists.sort((a, b) => a.d - b.d);
-    dists.slice(0, 20).forEach(({ idx }) => { items[idx]._renderOpacity = 1; });
-
-    renderer.requestRender();
+    dists.sort((a,b) => a.d - b.d);
+    dists.slice(0, 20).forEach(item => {
+        const el = imageNodeElements.find(node => node.id === `node-${item.idx}`);
+        if (el) { el.style.opacity = '1'; }
+    });
 }
 
 function clearHighlight() {
     if (!isHighlighting) return;
     isHighlighting = false;
-    if (renderer) {
-        for (const item of renderer.items) delete item._renderOpacity;
-        renderer.requestRender();
-    }
+    imageNodeElements.forEach(n => { 
+        n.style.opacity = '1'; 
+    });
 }
 
 function filterByMediaType(type) {
@@ -1582,6 +1537,222 @@ function hasActiveFilters() {
            activeScoreFilter > 0;
 }
 
+async function searchImagesOld() {
+    const keyword = document.getElementById('search-input').value.toLowerCase().trim();
+    activeColorFilter = null; // Clear color filter when searching text
+    
+    if (!keyword) { clearAll(); return; }
+    
+    statusDiv.textContent = 'FILTERING...';
+    setLoading(true);
+    
+    // Filter matching images using whole-word matching
+    const matchedImages = [];
+    // Create regex for whole word matching (with word boundaries)
+    const searchRegex = new RegExp(`\\b${keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+    
+    images.forEach((img, i) => {
+        const match = img.keywords && img.keywords.some(p => searchRegex.test(p.className));
+        if (match) {
+            matchedImages.push({ ...img, originalIndex: i });
+        }
+    });
+    
+    if (matchedImages.length === 0) {
+        statusDiv.textContent = 'NO_MATCHES';
+        setLoading(false);
+        // Still show all images but dimmed
+        imageNodeElements.forEach(el => el.style.opacity = '0.2');
+        return;
+    }
+    
+    statusDiv.textContent = `CLUSTERING: ${matchedImages.length} MATCHES`;
+    
+    // Re-cluster the matched images
+    const matchedVectors = matchedImages.filter(img => img.features).map(img => img.features);
+    
+    if (matchedVectors.length > 0 && matchedVectors.length > 1) {
+        const gridSize = Math.ceil(Math.sqrt(matchedVectors.length) * 1.5);
+        const tempSom = new SimpleSOM(gridSize, gridSize, 1, matchedVectors[0].length, Math.min(500, matchedVectors.length * 10));
+        
+        await tempSom.trainAsync(matchedVectors, (c, t) => {
+            statusDiv.textContent = `CLUSTERING: ${Math.round(c/t*100)}%`;
+        });
+        
+        matchedImages.forEach((img) => {
+            if (img.features) {
+                const pos = tempSom.getBMU(img.features);
+                img.xSearch = pos.x;
+                img.ySearch = pos.y;
+            }
+        });
+    } else {
+        // Single image or no features - just center it
+        matchedImages.forEach((img) => {
+            img.xSearch = 0;
+            img.ySearch = 0;
+        });
+    }
+    
+    // Clear and rebuild with only matched images
+    mapContainer.innerHTML = '';
+    imageNodeElements = [];
+    currentVisibleImages = matchedImages;
+    
+    const gridSize = Math.ceil(Math.sqrt(matchedImages.length) * 1.5);
+    const cellW = 4000 / (gridSize + 2);
+    const cellH = 4000 / (gridSize + 2);
+    
+    const fragment = document.createDocumentFragment();
+    
+    matchedImages.forEach((img, index) => {
+        const el = document.createElement('div');
+        el.className = 'image-node';
+        el.id = `node-${img.originalIndex}`;
+        el.style.width = `${cellW}px`;
+        el.style.height = `${cellH}px`;
+        
+        const x = (img.xSearch || 0) * cellW;
+        const y = (img.ySearch || 0) * cellH;
+        
+        el.style.setProperty('--tx', `${x}px`);
+        el.style.setProperty('--ty', `${y}px`);
+        el.style.setProperty('--tz', '0px');
+        el._tz_val = 0;
+        el._visible = true;
+        
+        el.onmouseenter = () => {
+            hoveredIndex = index;
+            let content = `ID: ${img.name.toUpperCase()}<br>`;
+            if (img.keywords && img.keywords.length > 0) {
+                const tags = img.keywords.map(k => k.className.toUpperCase()).join(', ');
+                content += `TAGS: ${tags}<br>`;
+            }
+            if (img.palette && img.palette.length > 0) {
+                content += `PALETTE:<br>`;
+                content += `<div class="palette-container">`;
+                img.palette.forEach(c => {
+                    content += `<div class="palette-swatch" style="background: rgb(${c[0]},${c[1]},${c[2]})" title="RGB: ${c.join(',')}"></div>`;
+                });
+                content += `</div>`;
+            } else {
+                content += `PALETTE: Scanning...<br>`;
+            }
+            content += `POS: [${Math.round(x)},${Math.round(y)},0]`;
+            semanticInfoDiv.innerHTML = content;
+            el.classList.add('is-hovered');
+            
+            // Update preview image - only show after loaded
+            const previewImg = document.getElementById('preview-img');
+            const previewPlaceholder = document.getElementById('preview-placeholder');
+            if (previewImg && previewPlaceholder) {
+                const imageUrl = isElectron ? `file:///${img.path.replace(/\\/g, '/')}` : (img.url || img.thumbUrl);
+                
+                // Preload image before showing
+                const tempImg = new Image();
+                tempImg.onload = () => {
+                    previewImg.src = imageUrl;
+                    previewImg.style.display = 'block';
+                    previewPlaceholder.style.display = 'none';
+                };
+                tempImg.onerror = () => {
+                    // On error, just keep placeholder visible
+                };
+                tempImg.src = imageUrl;
+            }
+        };
+        
+        el.onmouseleave = () => {
+            hoveredIndex = -1;
+            el.classList.remove('is-hovered');
+            
+            // Clear info text
+            if (semanticInfoDiv) {
+                semanticInfoDiv.textContent = 'Hover over an image to see details...';
+            }
+            
+            // Clear preview image
+            const previewImg = document.getElementById('preview-img');
+            const previewPlaceholder = document.getElementById('preview-placeholder');
+            if (previewImg && previewPlaceholder) {
+                previewImg.style.display = 'none';
+                previewPlaceholder.style.display = 'block';
+                previewImg.src = '';
+            }
+        };
+        
+        // Track mouse movement for click vs drag detection
+        let searchImageMouseDown = false;
+        let searchImageStartX = 0;
+        let searchImageStartY = 0;
+        let searchImageMouseButton = 0;
+        
+        el.onmousedown = (e) => {
+            searchImageMouseDown = true;
+            searchImageStartX = e.clientX;
+            searchImageStartY = e.clientY;
+            searchImageMouseButton = e.button;
+        };
+        
+        el.onmouseup = (e) => {
+            if (!searchImageMouseDown) return;
+            
+            // Calculate distance moved
+            const distMoved = Math.sqrt(
+                Math.pow(e.clientX - searchImageStartX, 2) + 
+                Math.pow(e.clientY - searchImageStartY, 2)
+            );
+            
+            // Only treat as click if moved less than 5 pixels AND it's left-click (button 0)
+            if (distMoved < 5 && searchImageMouseButton === 0) {
+                e.stopPropagation();
+                // Zoom into the grid, focusing on this image
+                // Pass image size to center properly
+                zoomToImage(x, y, 0, cellW, cellH);
+                // Reset global dragging state
+                isDragging = false;
+            }
+            
+            searchImageMouseDown = false;
+        };
+        
+        // Double-click for lightbox
+        el.ondblclick = (e) => {
+            e.stopPropagation();
+            showLightbox(index);
+        };
+        
+        const imageElement = document.createElement('img');
+        // In Electron mode, load thumbnail async (same as displayImages)
+        if (isElectron && !img.thumbnailData) {
+            // Show placeholder while loading
+            imageElement.src = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="150" height="150"%3E%3Crect fill="%23222" width="150" height="150"/%3E%3C/svg%3E';
+            // Load thumbnail data asynchronously
+            window.electronAPI.getImageData(img.path).then(result => {
+                img.thumbnailData = result.dataUrl;
+                imageElement.src = result.dataUrl;
+            }).catch(err => {
+                console.error('Error loading thumbnail:', err);
+            });
+        } else if (isElectron && img.thumbnailData) {
+            imageElement.src = img.thumbnailData;
+        } else {
+            imageElement.src = img.thumbUrl;
+        }
+        imageElement.loading = 'lazy';
+        el.appendChild(imageElement);
+        fragment.appendChild(el);
+        imageNodeElements.push(el);
+    });
+    
+    mapContainer.appendChild(fragment);
+    mapContainer.className = '';
+    
+    statusDiv.textContent = `FILTERED: ${matchedImages.length}`;
+    setLoading(false);
+    centerMap();
+}
+
 // --- Navigation & Transforms ---
 const main = document.getElementById('main');
 let scale = 1, pointX = 0, pointY = 0;
@@ -1641,13 +1812,45 @@ function animate(now) {
             transX += driftVelX * driftSpeed; transY += driftVelY * driftSpeed;
             transZ += driftVelZ * driftSpeed * 2; transZ = Math.min(0, Math.max(-8000, transZ));
         }
-        updateTransform();
+        updateTransform(); updateProximityFading();
     }
     requestAnimationFrame(animate);
 }
 requestAnimationFrame(animate);
 
-window.addEventListener('keydown', (e) => {
+let staggeredIndex = 0;
+const BATCH_SIZE = 200;
+
+function updateProximityFading() {
+    if (!is3D || imageNodeElements.length === 0) return;
+    const start = staggeredIndex; const end = Math.min(start + BATCH_SIZE, imageNodeElements.length);
+    for (let i = start; i < end; i++) {
+        const node = imageNodeElements[i];
+        const worldZ = node._tz_val + transZ;
+        
+        // Extended view distance
+        if (worldZ > 300 || worldZ < -15000) {
+            if (node._visible) { node.style.display = 'none'; node._visible = false; }
+            continue;
+        } else {
+            if (!node._visible) { node.style.display = 'block'; node._visible = true; }
+        }
+        
+        let opacity = 1; let brightness = 1;
+        
+        // Fade out only when very close to camera (near clip)
+        if (worldZ > 100) opacity = Math.max(0, 1 - (worldZ - 100) / 200);
+        
+        // Distance fog/darkness
+        if (worldZ < -3000) brightness = Math.max(0.1, 1 - (Math.abs(worldZ + 3000) / 8000));
+        
+        node.style.opacity = opacity; 
+        node.style.filter = `brightness(${brightness})`;
+    }
+    staggeredIndex = (staggeredIndex + BATCH_SIZE) % imageNodeElements.length;
+}
+
+window.addEventListener('keydown', (e) => { 
     // Ignore key events if typing in input
     if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
 
@@ -1694,7 +1897,15 @@ window.addEventListener('keyup', (e) => {
     }
 });
 function updateTransform() {
-    // Canvas renderer owns all drawing now; the old DOM map-container is unused.
+    if (is3D) {
+        mapContainer.style.transformOrigin = 'center center';
+        mapContainer.style.transform = `translateX(${transX}px) translateY(${transY}px) translateZ(${transZ}px) rotateX(${rotX}deg) rotateY(${rotY}deg)`;
+    } else {
+        mapContainer.style.transformOrigin = '0 0';
+        mapContainer.style.transform = `translate(${pointX}px, ${pointY}px) scale(${scale})`;
+    }
+    
+    // Sync camera with renderer
     if (renderer) {
         renderer.setCamera({
             x: is3D ? transX : pointX,
@@ -1711,17 +1922,9 @@ function centerMap() {
     if (is3D) reset3DView();
     else {
         const rect = main.getBoundingClientRect();
-        // Adjust initial scale to fit content if world is huge, but keep reasonable limits
-        // Default 4000 world width at 0.2 scale = 800px on screen
-        const targetScreenSize = Math.min(rect.width * 0.9, 1200); 
-        scale = targetScreenSize / currentWorldWidth;
-        
-        // Clamp scale to reasonable values
-        scale = Math.max(0.05, Math.min(0.5, scale));
-        
-        // Center the actual world content
-        pointX = (rect.width - currentWorldWidth * scale) / 2;
-        pointY = (rect.height - currentWorldHeight * scale) / 2;
+        scale = 0.2;
+        pointX = (rect.width - 4000 * scale) / 2;
+        pointY = (rect.height - 4000 * scale) / 2;
         updateTransform();
     }
 }
@@ -1874,7 +2077,6 @@ main.addEventListener('mousedown', (e) => {
     if (isSpacePressed || e.button === 2) dragButton = 2; 
     else if (e.button === 0) dragButton = 0; else return;
     e.preventDefault(); startX = e.clientX; startY = e.clientY; isDragging = true;
-    if (renderer) renderer.isDragging = true; // suppress per-frame hover hit-tests while panning
 });
 window.addEventListener('mousemove', (e) => {
     if (!isDragging) return;
@@ -1882,7 +2084,7 @@ window.addEventListener('mousemove', (e) => {
     if (is3D) { transX += dx; transY += dy; } else { pointX += dx; pointY += dy; }
     startX = e.clientX; startY = e.clientY; updateTransform();
 });
-window.addEventListener('mouseup', () => { isDragging = false; if (renderer) renderer.isDragging = false; });
+window.addEventListener('mouseup', () => isDragging = false);
 main.addEventListener('wheel', (e) => {
     e.preventDefault();
     if (is3D) { 
@@ -2407,15 +2609,12 @@ async function filterByColor(targetColor) {
         matchedImages.forEach((img) => {
             if (img.features) {
                 const pos = positions[posIndex++];
-                // matchedImages are spread copies, so writing x/y here gives the
-                // filtered view its own cluster layout without disturbing the
-                // originals' semantic coordinates. displayImages reads x/y.
-                img.x = pos.x;
-                img.y = pos.y;
+                img.xSearch = pos.x;
+                img.ySearch = pos.y;
             }
         });
     } else {
-        matchedImages.forEach(img => { img.x = 0; img.y = 0; });
+        matchedImages.forEach(img => { img.xSearch = 0; img.ySearch = 0; });
     }
     
     // Set coordinates for clustering and display with canvas renderer
@@ -2559,15 +2758,13 @@ async function deleteLibrary(libraryId) {
     // Delete database file
     await window.electronAPI.deleteLibraryDb(libraryId);
     
-    // Clear if it was the active library. (#folder-path / map-container /
-    // imageNodeElements are all pre-canvas-migration leftovers — the old line
-    // `getElementById('folder-path').value` threw here because the element no
-    // longer exists, aborting the rest of deleteLibrary. Clear the renderer instead.)
+    // Clear if it was the active library
     if (currentLibrary && currentLibrary.id === libraryId) {
         currentLibrary = null;
+        document.getElementById('folder-path').value = '';
+        mapContainer.innerHTML = '';
         images = [];
-        currentVisibleImages = [];
-        if (renderer) renderer.setItems([]);
+        imageNodeElements = [];
     }
     
     renderLibrariesList();
@@ -2772,10 +2969,7 @@ async function sortBySimilarity() {
     
     currentVisibleImages = imagesWithSimilarity;
     displaySimilarityImages(imagesWithSimilarity);
-    // Recenter on the new layout — setSorting returns early for similarity, so
-    // centerMap() is otherwise never called and the view stays where it was.
-    if (!is3D) centerMap();
-
+    
     statusDiv.textContent = 'SORTED_BY_SIMILARITY';
     setLoading(false);
 }
@@ -2909,16 +3103,14 @@ async function applyFilters() {
             matchedImages.forEach((img) => {
                 if (img.features) {
                     const pos = positions[posIndex++];
-                    // Copies, so x/y here is the filtered cluster layout the
-                    // renderer will draw; originals keep their own coordinates.
-                    img.x = pos.x;
-                    img.y = pos.y;
+                    img.xSearch = pos.x;
+                    img.ySearch = pos.y;
                 }
             });
         } else {
-            matchedImages.forEach(img => { img.x = 0; img.y = 0; });
+            matchedImages.forEach(img => { img.xSearch = 0; img.ySearch = 0; });
         }
-
+        
         currentVisibleImages = matchedImages;
         displayFilteredImages(matchedImages);
         statusDiv.textContent = `FILTERED: ${filtered.length}`;
@@ -3109,9 +3301,7 @@ async function sortByVibeGradient() {
     
     currentVisibleImages = imagesWithProjection;
     displayVibeGradientImages(imagesWithProjection);
-    // Recenter on the new layout (setSorting returns early for vibe).
-    if (!is3D) centerMap();
-
+    
     statusDiv.textContent = 'VIBE_GRADIENT_ACTIVE';
     setLoading(false);
 }
